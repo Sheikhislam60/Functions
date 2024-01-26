@@ -31,7 +31,6 @@ def loadData(fileName, params):
     x = np.squeeze(matFile['x_n1'], axis=1)[:-offset]
     y = np.squeeze(matFile['y_n1'], axis=1)[offset:]
     y = y - np.mean(y)
-    print(x.shape, y.shape)
     noise = np.squeeze(matFile['noiseSample'], axis=1)
     noisePower = np.squeeze(matFile['noisePower'], axis=1)
     # Return
