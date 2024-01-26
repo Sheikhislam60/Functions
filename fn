@@ -18,24 +18,24 @@ import scipy
 import scipy.io
 from scipy.signal import savgol_filter, decimate
 
-# Loads testbed data from file
 def loadData(fileName, params):
-  # Get parameters
-  dataOffset = params['dataOffset']
-  chanLen = params['hSILen']
+    # Get parameters
+    dataOffset = params['dataOffset']
+    chanLen = params['hSILen']
+    offset = np.maximum(dataOffset-int(np.ceil(chanLen/2)),1)
 
-  # Load the file
-  matFile = scipy.io.loadmat(fileName)
+    # Load the file
+    matFile = scipy.io.loadmat(fileName)
 
-  # Prepare data
-  x = np.squeeze(matFile['x_n1'], axis=1)[:-dataOffset]
-  y = np.squeeze(matFile['y_n1'], axis=1)[dataOffset:]
-  y = y[0:x.size]
-  y = y - np.mean(y)
-  noise = np.squeeze(matFile['noiseSample'], axis=1)
-  noisePower = np.squeeze(matFile['noisePower'], axis=1)
-  # Return
-  return x, y, noise, noisePower
+    # Prepare data
+    x = np.squeeze(matFile['txSamples'], axis=1)[:-offset]
+    y = np.squeeze(matFile['analogResidual'], axis=1)[offset:]
+    y = y - np.mean(y)
+    print(x.shape, y.shape)
+    noise = np.squeeze(matFile['noiseSamples'], axis=1)
+    noisePower = np.squeeze(matFile['noisePower'], axis=1)
+    # Return
+    return x, y, noise, noisePower
     
     
 # Plots PSD and computes various signal powers
