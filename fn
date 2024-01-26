@@ -1,0 +1,239 @@
+import torch
+import matplotlib.pyplot as plt
+import numpy as np
+
+from torch import nn
+
+import os
+import zipfile
+
+from pathlib import Path
+
+import requests
+import os
+
+from typing import Optional, Tuple
+import numpy as np
+import scipy
+import scipy.io
+from scipy.signal import savgol_filter, decimate
+
+# Loads testbed data from file
+def loadData(fileName, params):
+	# Get parameters
+	dataOffset = params['dataOffset']
+	chanLen = params['hSILen']
+	offset = np.maximum(dataOffset-int(np.ceil(chanLen/2)),1)
+
+	# Load the file
+	matFile = scipy.io.loadmat(fileName)
+
+	# Prepare data
+	x = np.squeeze(matFile['txSamples'], axis=1)[:-offset]
+	y = np.squeeze(matFile['analogResidual'], axis=1)[offset:]
+	y = y - np.mean(y)
+	noise = np.squeeze(matFile['noiseSamples'], axis=1)[0:x.size]
+	noisePower = np.squeeze(matFile['noisePower'], axis=1)
+
+	# Return
+	return x, y, noise, noisePower
+    
+    
+# Plots PSD and computes various signal powers
+def plotPSD(y_test, yCanc, yCancNonLin, noise, params, yVar=1):
+
+  # Get self-interference channel length
+  chanLen = params['hSILen']
+
+  # Calculate signal powers
+  noisePower = 10*np.log10(np.mean(np.abs(noise)**2))
+  yTestPower = 10*np.log10(np.mean(np.abs(y_test)**2))
+  yTestLinCancPower = 10*np.log10(np.mean(np.abs(y_test-yCanc)**2))
+  yTestNonLinCancPower = 10*np.log10(np.mean(np.abs(((y_test-yCanc)/np.sqrt(yVar)-yCancNonLin)*np.sqrt(yVar))**2))
+
+  # Calculate spectra
+  samplingFreqMHz = params['samplingFreqMHz']
+  fftpoints = 4096
+  scalingConst = samplingFreqMHz*1e6
+  freqAxis = np.linspace(-samplingFreqMHz/2,samplingFreqMHz/2,fftpoints)
+  savgolWindow = 45
+  savgolDegree = 1
+
+  noisefft = np.fft.fftshift(np.fft.fft(noise/np.sqrt(scalingConst), fftpoints, axis=0, norm="ortho"))
+  yTestFFT = np.fft.fftshift(np.fft.fft(y_test/np.sqrt(scalingConst), fftpoints, axis=0, norm="ortho"))
+  yTestLinCancFFT = np.fft.fftshift(np.fft.fft((y_test-yCanc)/np.sqrt(scalingConst), fftpoints, axis=0, norm="ortho"))
+  yTestNonLinCancFFT = np.fft.fftshift(np.fft.fft((((y_test-yCanc)/np.sqrt(yVar)-yCancNonLin)*np.sqrt(yVar))/np.sqrt(scalingConst), fftpoints, axis=0, norm="ortho"))
+
+  # Plot spectra
+  toPlotyTestFFT = 10*np.log10(savgol_filter(np.power(np.abs(yTestFFT),2),savgolWindow,savgolDegree))
+  toPlotyTestLinCancFFT = 10*np.log10(savgol_filter(np.power(np.abs(yTestLinCancFFT),2),savgolWindow,savgolDegree))
+  toPlotyTestNonLinCancFFT = 10*np.log10(savgol_filter(np.power(np.abs(yTestNonLinCancFFT),2),savgolWindow,savgolDegree))
+  toPlotnoisefft = 10*np.log10(savgol_filter(np.power(np.abs(noisefft),2),savgolWindow,savgolDegree))
+
+  plt.plot(freqAxis, toPlotyTestFFT, 'b-', freqAxis, toPlotyTestLinCancFFT, 'r-', freqAxis, toPlotyTestNonLinCancFFT, 'm-', freqAxis, toPlotnoisefft, 'k-')
+  plt.xlabel('Frequency (MHz)')
+  plt.ylabel('Power Spectral Density (dBm/Hz)')
+  plt.title('Non-Linear Cancellation')
+  plt.xlim([ -samplingFreqMHz/2, samplingFreqMHz/2])
+  plt.ylim([ -170, -90 ])
+  plt.xticks(range(-int(samplingFreqMHz/2),int(samplingFreqMHz/2+1),2))
+  plt.grid(which='major', alpha=0.25)
+  plt.legend(['Received SI Signal ({:.1f} dBm)'.format(yTestPower), 'After Linear Digital Cancellation ({:.1f} dBm)'.format(yTestLinCancPower), 'After Non-Linear Digital Cancellation ({:.1f} dBm)'.format(yTestNonLinCancPower), 'Measured Noise Floor ({:.1f} dBm)'.format(noisePower)], loc='upper center')
+  plt.savefig('/content/NL.pdf', bbox_inches='tight')
+  plt.show()
+
+  # Return signal powers
+  return noisePower, yTestPower, yTestLinCancPower, yTestNonLinCancPower
+
+
+
+# Estimates parameters for linear cancellation
+def SIestimationLinear(x, y, params):
+	# Get channel length
+	chanLen = params['hSILen']
+	# Construct LS problem
+	A = np.reshape([np.flip(x[i+1:i+chanLen+1],axis=0) for i in range(x.size-chanLen)], (x.size-chanLen, chanLen))
+	# Solve LS problem
+	h = np.linalg.lstsq(A, y[chanLen:], rcond=None)[0]
+	# Output estimated channels
+	return h
+
+
+# Perform linear cancellation based on estimated parameters
+def SIcancellationLinear(x, h, params):
+
+	# Calculate the cancellation signal
+	xcan = np.convolve(x, h, mode='full')
+	xcan = xcan[0:x.size]
+
+	# Output
+	return xcan
+
+# Data preparation
+def Dataprep(x_train, y_train, x_test, y_test, yCanc_train, yCanc_test, chanLen):
+	# Prepare training data for NN
+	y_train = y_train - yCanc_train
+	yVar = np.var(y_train)
+	y_train = y_train/np.sqrt(yVar)
+	
+	x_train_real = np.reshape(np.array([x_train[i:i+chanLen].real for i in range(x_train.size-chanLen)]), (x_train.size-chanLen, chanLen))
+	x_train_imag = np.reshape(np.array([x_train[i:i+chanLen].imag for i in range(x_train.size-chanLen)]), (x_train.size-chanLen, chanLen))
+	x_train = np.zeros((x_train.size-chanLen, 2*chanLen))
+	x_train[:,0:chanLen] = x_train_real
+	x_train[:,chanLen:2*chanLen] = x_train_imag
+	y_train = np.reshape(y_train[chanLen:], (y_train.size-chanLen, 1))
+	y_train = np.hstack((y_train.real , y_train.imag))
+
+	# Prepare test data for NN
+	y_test = y_test - yCanc_test
+	y_test = y_test/np.sqrt(yVar)
+	
+	x_test_real = np.reshape(np.array([x_test[i:i+chanLen].real for i in range(x_test.size-chanLen)]), (x_test.size-chanLen, chanLen))
+	x_test_imag = np.reshape(np.array([x_test[i:i+chanLen].imag for i in range(x_test.size-chanLen)]), (x_test.size-chanLen, chanLen))
+	x_test = np.zeros((x_test.size-chanLen, 2*chanLen))
+	x_test[:,0:chanLen] = x_test_real
+	x_test[:,chanLen:2*chanLen] = x_test_imag
+	y_test = np.reshape(y_test[chanLen:], (y_test.size-chanLen, 1))
+	y_test = np.hstack((y_test.real , y_test.imag))
+	
+	
+	return x_train, y_train, x_test, y_test, yVar
+
+
+# Class function
+class LSTMCell(nn.Module):
+  def __init__(self, input_size: int, hidden_size: int, layer_norm: bool = False):
+    super().__init__()
+    self.hidden_lin = nn.Linear(hidden_size, 4 * hidden_size)
+    self.input_lin = nn.Linear(input_size, 4 * hidden_size, bias=False)
+
+    if layer_norm:
+        self.layer_norm = nn.ModuleList([nn.LayerNorm(hidden_size) for _ in range(4)])
+        self.layer_norm_c = nn.LayerNorm(hidden_size)
+    else:
+        self.layer_norm = nn.ModuleList([nn.Identity() for _ in range(4)])
+        self.layer_norm_c = nn.Identity()
+
+  def forward(self, x: torch.Tensor, h: torch.Tensor, c: torch.Tensor):
+      ifgo = self.hidden_lin(h) + self.input_lin(x)
+      ifgo = ifgo.chunk(4, dim=-1)
+      ifgo = [self.layer_norm[i](ifgo[i]) for i in range(4)]
+      i, f, g, o = ifgo
+
+      c_next = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(g)
+      h_next = torch.sigmoid(o) * torch.tanh(self.layer_norm_c(c_next))
+
+      return h_next, c_next
+
+class HyperLSTMCell(nn.Module):
+  def __init__(self, input_size: int, hidden_size: int, hyper_size: int, n_z: int):
+    super().__init__()
+    self.hyper = LSTMCell(hidden_size + input_size, hyper_size, layer_norm=True)
+    self.z_h = nn.Linear(hyper_size, 4 * n_z)
+    self.z_x = nn.Linear(hyper_size, 4 * n_z)
+    self.z_b = nn.Linear(hyper_size, 4 * n_z, bias=False)
+    d_h = [nn.Linear(n_z, hidden_size, bias=False) for _ in range(4)]
+    self.d_h = nn.ModuleList(d_h)
+    d_x = [nn.Linear(n_z, hidden_size, bias=False) for _ in range(4)]
+    self.d_x = nn.ModuleList(d_x)
+    d_b = [nn.Linear(n_z, hidden_size) for _ in range(4)]
+    self.d_b = nn.ModuleList(d_b)
+    self.w_h = nn.ParameterList([nn.Parameter(torch.zeros(hidden_size, hidden_size)) for _ in range(4)])
+    self.w_x = nn.ParameterList([nn.Parameter(torch.zeros(hidden_size, input_size)) for _ in range(4)])
+    self.layer_norm = nn.ModuleList([nn.LayerNorm(hidden_size) for _ in range(4)])
+    self.layer_norm_c = nn.LayerNorm(hidden_size)
+
+
+  def forward(self, x: torch.Tensor,h: torch.Tensor, c: torch.Tensor,h_hat: torch.Tensor, c_hat: torch.Tensor):
+    x_hat = torch.cat((h, x), dim=-1)
+    h_hat, c_hat = self.hyper(x_hat, h_hat, c_hat)
+    z_h = self.z_h(h_hat).chunk(4, dim=-1)
+    z_x = self.z_x(h_hat).chunk(4, dim=-1)
+    z_b = self.z_b(h_hat).chunk(4, dim=-1)
+    ifgo = []
+    for i in range(4):
+      d_h = self.d_h[i](z_h[i])
+      d_x = self.d_x[i](z_x[i])
+      y = d_h * torch.einsum('ij,bj->bi', self.w_h[i], h) + d_x * torch.einsum('ij,bj->bi', self.w_x[i], x) + self.d_b[i](z_b[i])
+      ifgo.append(self.layer_norm[i](y))
+    i, f, g, o = ifgo
+    c_next = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(g)
+    h_next = torch.sigmoid(o) * torch.tanh(self.layer_norm_c(c_next))
+    return h_next, c_next, h_hat, c_hat
+
+class HyperLSTM(nn.Module):
+  def __init__(self, input_size: int, hidden_size: int, hyper_size: int, n_z: int, n_layers: int):
+    super().__init__()
+    self.n_layers = n_layers
+    self.hidden_size = hidden_size
+    self.hyper_size = hyper_size
+    self.cells = nn.ModuleList([HyperLSTMCell(input_size, hidden_size, hyper_size, n_z)] +[HyperLSTMCell(hidden_size, hidden_size, hyper_size, n_z) for _ in range(n_layers - 1)])
+    self.fc = nn.Linear(hidden_size, 2)  # Add this line
+
+  def forward(self, x: torch.Tensor, state: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None):
+    n_steps, batch_size = x.shape[:2]
+    if state is None:
+      h = [x.new_zeros(batch_size, self.hidden_size) for _ in range(self.n_layers)]
+      c = [x.new_zeros(batch_size, self.hidden_size) for _ in range(self.n_layers)]
+      h_hat = [x.new_zeros(batch_size, self.hyper_size) for _ in range(self.n_layers)]
+      c_hat = [x.new_zeros(batch_size, self.hyper_size) for _ in range(self.n_layers)]
+    else:
+      (h, c, h_hat, c_hat) = state
+      h, c = list(torch.unbind(h)), list(torch.unbind(c))
+      h_hat, c_hat = list(torch.unbind(h_hat)), list(torch.unbind(c_hat))
+    out = []
+    for t in range(n_steps):
+      inp = x[t]
+      for layer in range(self.n_layers):
+        h[layer], c[layer], h_hat[layer], c_hat[layer] = self.cells[layer](inp, h[layer], c[layer], h_hat[layer], c_hat[layer])
+        inp = h[layer]
+      out.append(h[-1])
+    out = self.fc(torch.stack(out))  # Add this line
+    h = torch.stack(h)
+    c = torch.stack(c)
+    h_hat = torch.stack(h_hat)
+    c_hat = torch.stack(c_hat)
+    return out, (h, c, h_hat, c_hat)
+
+
+
