@@ -28,11 +28,11 @@ def loadData(fileName, params):
     matFile = scipy.io.loadmat(fileName)
 
     # Prepare data
-    x = np.squeeze(matFile['txSamples'], axis=1)[:-offset]
-    y = np.squeeze(matFile['analogResidual'], axis=1)[offset:]
+    x = np.squeeze(matFile['x_n1'], axis=1)[:-offset]
+    y = np.squeeze(matFile['y_n1'], axis=1)[offset:]
     y = y - np.mean(y)
     print(x.shape, y.shape)
-    noise = np.squeeze(matFile['noiseSamples'], axis=1)
+    noise = np.squeeze(matFile['noiseSample'], axis=1)
     noisePower = np.squeeze(matFile['noisePower'], axis=1)
     # Return
     return x, y, noise, noisePower
