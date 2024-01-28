@@ -233,5 +233,12 @@ class HyperLSTM(nn.Module):
     c_hat = torch.stack(c_hat)
     return out, (h, c, h_hat, c_hat)
 
-
+class CustDat(torch.utils.data.Dataset):
+  def __init__(self, train, target):
+    self.train = train
+    self.target = target
+  def __len__(self):
+    return self.train.shape[0]
+  def __getitem__(self, idx):
+    return self.train[idx], self.target[idx]
 
